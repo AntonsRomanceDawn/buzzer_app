@@ -13,6 +13,7 @@ use core::adapter::{self, BuzzerInput, BuzzerOutput, TimeSource};
 use core::game::{Action, BuzzerGame, Config, PlayerId};
 
 use crate::dtos::ServerMessage;
+use crate::utils::time::now_millis;
 
 pub fn spawn_room_loop(
     tick_in_ms: u64,
@@ -83,17 +84,23 @@ impl BuzzerOutput for RoutedOutput {
                 let msg = ServerMessage::Accepted {
                     name,
                     deadline_in_ms,
+                    ts_ms: now_millis(),
                 };
                 self.broadcast(msg);
             }
             Action::Rejected(player) => {
                 if let Some(tx) = self.routes.get(&player).map(|entry| entry.value().clone()) {
-                    let _ = tx.send(serialize(ServerMessage::Rejected));
+                    let _ = tx.send(serialize(ServerMessage::Rejected {
+                        ts_ms: now_millis(),
+                    }));
                 }
             }
             Action::TimedOut(player) => {
                 let name = self.name_for(player);
-                let msg = ServerMessage::TimedOut { name };
+                let msg = ServerMessage::TimedOut {
+                    name,
+                    ts_ms: now_millis(),
+                };
                 self.broadcast(msg);
             }
         }

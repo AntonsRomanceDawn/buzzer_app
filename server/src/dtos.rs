@@ -22,17 +22,20 @@ pub struct CreateRoomResponse {
 
 #[derive(Deserialize)]
 pub struct JoinRoomRequest {
-    pub name: Option<String>,
+    pub name: String,
 }
 
 #[derive(Serialize)]
 pub struct JoinRoomResponse {
+    pub room_id: String,
     pub token: String,
+    pub answer_window_in_ms: u64,
 }
 
 #[derive(Serialize)]
 pub struct RefreshTokenResponse {
-    pub token: String,
+    pub room_id: String,
+    pub new_token: String,
 }
 
 #[derive(Deserialize)]
@@ -47,13 +50,13 @@ pub enum ClientMessage {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Accepted { name: String, deadline_in_ms: u64 },
-    Participants { participants: Vec<ParticipantInfo> },
-    RoundStarted,
-    Rejected,
-    TimedOut { name: String },
-    ActionDenied { reason: String },
-    Kicked,
+    Accepted { name: String, deadline_in_ms: u64, ts_ms: u64 },
+    Participants { participants: Vec<ParticipantInfo>, ts_ms: u64 },
+    RoundStarted { ts_ms: u64 },
+    Rejected { ts_ms: u64 },
+    TimedOut { name: String, ts_ms: u64 },
+    ActionDenied { reason: String, ts_ms: u64 },
+    Kicked { ts_ms: u64 },
 }
 
 #[derive(Serialize)]

@@ -6,3 +6,10 @@ pub fn now_seconds() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}

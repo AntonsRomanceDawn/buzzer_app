@@ -1,9 +1,11 @@
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, errors::Error};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::errors::ErrorKind;
 use serde::{Deserialize, Serialize};
 
 use core::game::PlayerId;
 
 use crate::dtos::Role;
+use crate::errors::AppError;
 use crate::utils::time::now_seconds;
 
 #[derive(Serialize, Deserialize)]
@@ -39,21 +41,28 @@ impl JwtAuth {
         player_id: PlayerId,
         name: &str,
         role: Role,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, u64), AppError> {
         let now = now_seconds();
+        let exp = now + self.ttl_seconds;
         let claims = Claims {
             room_id: room_id.to_string(),
             player_id,
             name: name.to_string(),
             role,
             iat: now,
-            exp: now + self.ttl_seconds,
+            exp,
         };
-        jsonwebtoken::encode(&Header::default(), &claims, &self.encoding)
+        let token = jsonwebtoken::encode(&Header::default(), &claims, &self.encoding)
+            .map_err(|_| AppError::Internal)?;
+        Ok((token, exp))
     }
 
-    pub fn verify(&self, token: &str) -> Result<Claims, Error> {
-        let data = jsonwebtoken::decode::<Claims>(token, &self.decoding, &self.validation)?;
+    pub fn verify(&self, token: &str) -> Result<Claims, AppError> {
+        let data = jsonwebtoken::decode::<Claims>(token, &self.decoding, &self.validation)
+            .map_err(|err| match err.kind() {
+                ErrorKind::ExpiredSignature => AppError::SessionExpired,
+                _ => AppError::InvalidToken,
+            })?;
         Ok(data.claims)
     }
 }

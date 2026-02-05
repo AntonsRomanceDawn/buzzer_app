@@ -1,11 +1,13 @@
 mod adapter;
 mod auth;
 mod dtos;
+mod errors;
 mod socket;
 mod state;
 mod utils;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -15,13 +17,16 @@ use axum::{
     routing::{get, post},
 };
 use tokio::net::TcpListener;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use dtos::{
     CreateRoomRequest, CreateRoomResponse, JoinRoomRequest, JoinRoomResponse, RefreshTokenResponse,
-    Role,
 };
+use errors::AppError;
 use socket::{PlayerSession, handle_socket};
-use state::{AppState, RoomConfig};
+use state::app_state::AppState;
+
+use crate::state::room_state::RoomConfig;
 
 const TICK_IN_MS: u64 = 10;
 const DEFAULT_ANSWER_WINDOW_IN_MS: u64 = 5_000;
@@ -31,26 +36,39 @@ const MAX_ANSWER_WINDOW_IN_MS: u64 = 60_000;
 #[tokio::main]
 async fn main() {
     let state = AppState::new();
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(30)
+            .burst_size(60)
+            .finish()
+            .expect("valid rate limit config"),
+    );
 
     let app = Router::new()
         .route("/api/rooms", post(create_room))
-        .route("/api/rooms/:room_id/join", post(join_room))
-        .route("/api/rooms/:room_id/refresh_token", post(token_refresh))
-        .route("/ws/:room_id", get(ws_handler))
+        .route("/api/rooms/{room_id}/join", post(join_room))
+        .route("/api/rooms/{room_id}/refresh_token", post(token_refresh))
+        .route("/ws/{room_id}", get(ws_handler))
+        .layer(GovernorLayer::new(governor_conf))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await.expect("bind");
     println!("Web server running on http://{}", addr);
-    axum::serve(listener, app).await.expect("serve");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("serve");
 }
 
 async fn create_room(
     State(state): State<AppState>,
     Json(req): Json<CreateRoomRequest>,
-) -> impl IntoResponse {
+) -> Result<(StatusCode, Json<CreateRoomResponse>), AppError> {
     if req.name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "invalid_name").into_response();
+        return Err(AppError::InvalidEmptyName);
     }
 
     let answer_window_in_ms = match req.answer_window_in_ms {
@@ -67,145 +85,66 @@ async fn create_room(
         TICK_IN_MS,
     );
 
-    let player_id = match room.insert_player(req.name.clone(), Role::Admin) {
-        Some(player_id) => player_id,
-        None => return (StatusCode::FORBIDDEN, "full_room").into_response(),
-    };
-
-    room.set_admin_id(player_id);
-
-    let token = match state
-        .auth()
-        .issue(&room_id, player_id, &req.name, Role::Admin)
-    {
-        Ok(token) => token,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    let token = room.create_admin(&req.name).await?;
 
     let response = CreateRoomResponse {
         room_id,
         token,
         answer_window_in_ms,
     };
-    (StatusCode::CREATED, Json(response)).into_response()
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn join_room(
     Path(room_id): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Option<Json<JoinRoomRequest>>,
-) -> impl IntoResponse {
-    let Some(room) = state.get_room(&room_id) else {
-        return (StatusCode::NOT_FOUND, "room_not_found").into_response();
-    };
+    Json(req): Json<JoinRoomRequest>,
+) -> Result<(StatusCode, Json<JoinRoomResponse>), AppError> {
+    let requested_name = req.name.trim().to_string();
+    if requested_name.is_empty() {
+        return Err(AppError::InvalidEmptyName);
+    }
 
-    let token_from_header = headers
+    let room = state.get_room(&room_id)?;
+    let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_string);
+        .and_then(|value| value.strip_prefix("Bearer "));
 
-    if let Some(token) = token_from_header {
-        let (rm_id, player_id, name, _role, _iat, _exp) = match state.auth().verify(&token) {
-            Ok(c) => (c.room_id, c.player_id, c.name, c.role, c.iat, c.exp),
-            Err(_) => return (StatusCode::UNAUTHORIZED, "invalid_token").into_response(),
-        };
-
-        if rm_id != room_id {
-            return (StatusCode::FORBIDDEN, "room_mismatch").into_response();
-        }
-
-        if !room.player_matches(player_id, &name) {
-            return (StatusCode::FORBIDDEN, "user_not_in_room").into_response();
-        }
-
-        let token = match state.auth().issue(&room_id, player_id, &name, Role::Player) {
-            Ok(token) => token,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-
-        room.broadcast_participants();
-        let response = JoinRoomResponse { token: token };
-
-        return (StatusCode::OK, Json(response)).into_response();
-    }
-
-    let Some(Json(req)) = body else {
-        return (StatusCode::UNAUTHORIZED, "auth_required").into_response();
+    let token = room.join(&requested_name, token).await?;
+    let response = JoinRoomResponse {
+        room_id: room_id.to_string(),
+        token,
+        answer_window_in_ms: room.answer_window_in_ms(),
     };
-
-    let Some(name) = req.name else {
-        return (StatusCode::UNAUTHORIZED, "auth_required").into_response();
-    };
-
-    if name.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "invalid_name").into_response();
-    }
-
-    if room.name_exists(&name) {
-        return (StatusCode::CONFLICT, "name_taken").into_response();
-    }
-
-    let player_id = match room.insert_player(name.clone(), Role::Player) {
-        Some(player_id) => player_id,
-        None => return (StatusCode::CONFLICT, "full_room").into_response(),
-    };
-
-    let token = match state.auth().issue(&room_id, player_id, &name, Role::Player) {
-        Ok(token) => token,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "auth_failed").into_response(),
-    };
-
-    room.broadcast_participants();
-    let response = JoinRoomResponse { token: token };
-
-    (StatusCode::OK, Json(response)).into_response()
+    Ok((StatusCode::OK, Json(response)))
 }
 
 async fn token_refresh(
     Path(room_id): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let Some(room) = state.get_room(&room_id) else {
-        return (StatusCode::NOT_FOUND, "room_not_found").into_response();
-    };
+) -> Result<(StatusCode, Json<RefreshTokenResponse>), AppError> {
+    let room = state.get_room(&room_id)?;
 
     let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
     else {
-        return (StatusCode::UNAUTHORIZED, "auth_required").into_response();
+        return Err(AppError::AuthRequired);
     };
 
-    let claims = match state.auth().verify(token) {
-        Ok(claims) => claims,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "invalid_token").into_response(),
-    };
+    let new_token = room.refresh_token(token).await?;
 
-    if claims.room_id != room_id {
-        return (StatusCode::FORBIDDEN, "room_mismatch").into_response();
-    }
-
-    if !room.player_matches(claims.player_id, &claims.name) {
-        return (StatusCode::FORBIDDEN, "user_not_in_room").into_response();
-    }
-
-    let new_token = match state
-        .auth()
-        .issue(&room_id, claims.player_id, &claims.name, claims.role)
-    {
-        Ok(token) => token,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    (
+    Ok((
         StatusCode::OK,
-        Json(RefreshTokenResponse { token: new_token }),
-    )
-        .into_response()
+        Json(RefreshTokenResponse {
+            room_id: room_id.to_string(),
+            new_token,
+        }),
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -218,29 +157,25 @@ async fn ws_handler(
     State(state): State<AppState>,
     Query(query): Query<WsAuthQuery>,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    let Some(room) = state.get_room(&room_id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+) -> Result<axum::response::Response, AppError> {
+    let room = state.get_room(&room_id)?;
 
-    let claims = match state.auth().verify(&query.token) {
-        Ok(claims) => claims,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-    };
+    let claims = state.auth().verify(&query.token)?;
 
     if claims.room_id != room_id {
-        return StatusCode::FORBIDDEN.into_response();
+        return Err(AppError::RoomMismatch);
     }
 
     if !room.player_matches(claims.player_id, &claims.name) {
-        return StatusCode::FORBIDDEN.into_response();
+        return Err(AppError::UserNotInRoom);
     }
 
     let session = PlayerSession {
         player_id: claims.player_id,
         name: claims.name,
-        role: claims.role,
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, room, session))
+    Ok(ws
+        .on_upgrade(move |socket| handle_socket(socket, room, session))
+        .into_response())
 }
