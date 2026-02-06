@@ -1,5 +1,6 @@
 export const TOKEN_STORAGE_KEY = 'bg_tokens'
 export const NAME_STORAGE_KEY = 'bg_names'
+export const ACTIVE_ROOM_STORAGE_KEY = 'bg_active_room'
 
 function loadMap(key: string): Record<string, string> {
     try {
@@ -26,8 +27,22 @@ export function getStoredName(roomId: string): string | null {
     return loadMap(NAME_STORAGE_KEY)[roomId] ?? null
 }
 
+export function getActiveRoomId(): string | null {
+    return localStorage.getItem(ACTIVE_ROOM_STORAGE_KEY)
+}
+
+export function setActiveRoomId(roomId: string) {
+    localStorage.setItem(ACTIVE_ROOM_STORAGE_KEY, roomId)
+}
+
+export function clearActiveRoomId() {
+    localStorage.removeItem(ACTIVE_ROOM_STORAGE_KEY)
+}
+
 export function persistAuth(roomId: string, token?: string, name?: string) {
     if (!roomId) return
+    setActiveRoomId(roomId)
+
     if (token) {
         const tokens = loadMap(TOKEN_STORAGE_KEY)
         tokens[roomId] = token

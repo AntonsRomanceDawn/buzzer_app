@@ -1,8 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { useCreateRoom, useJoinRoom, useRefreshToken } from './hooks/useRoomMutations'
 import { type SoundSettings, useSoundBoard } from './hooks/useSoundBoard'
-import { type Role } from './lib/api'
-import { getStoredName, getStoredToken, persistAuth } from './lib/storage'
+import { ApiError, roomsApi, type Role } from './lib/api'
+import {
+    clearActiveRoomId,
+    getActiveRoomId,
+    getStoredName,
+    getStoredToken,
+    persistAuth,
+} from './lib/storage'
 import './App.css'
 
 type ParticipantInfo = {
@@ -67,6 +73,7 @@ function App() {
     const [token, setToken] = useState<string | null>(null)
     const [view, setView] = useState<'landing' | 'room'>('landing')
     const [error, setError] = useState<string | null>(null)
+    const [retryDeadline, setRetryDeadline] = useState<number | null>(null)
     const [wsState, setWsState] = useState<'disconnected' | 'connecting' | 'connected'>(
         'disconnected'
     )
@@ -74,6 +81,7 @@ function App() {
     const [adminTarget, setAdminTarget] = useState('')
     const [kickTarget, setKickTarget] = useState('')
     const [result, setResult] = useState<'idle' | 'won' | 'lost' | 'rejected'>('idle')
+    const [winnerName, setWinnerName] = useState('')
     const [myName, setMyName] = useState('')
     const [roomMode, setRoomMode] = useState<'create' | 'join'>('create')
     const [answerWindowInMs, setAnswerWindowInMs] = useState('5000')
@@ -95,6 +103,7 @@ function App() {
     const soundMenuRef = useRef<HTMLDivElement | null>(null)
     const soundSettingsBackupRef = useRef<SoundSettings | null>(null)
     const soundBoardRef = useRef<ReturnType<typeof useSoundBoard> | null>(null)
+    const connectionFailuresRef = useRef(0)
     const createRoomMutation = useCreateRoom()
     const joinRoomMutation = useJoinRoom()
     const refreshTokenMutation = useRefreshToken()
@@ -106,6 +115,25 @@ function App() {
         soundSettings.lose ||
         soundSettings.timeout
     const soundBoard = useSoundBoard(soundEnabled, soundSettings)
+
+    useEffect(() => {
+        const activeRoomId = getActiveRoomId()
+        if (!activeRoomId) return
+
+        setRoomId(activeRoomId)
+        const savedToken = getStoredToken(activeRoomId)
+        if (savedToken) setToken(savedToken)
+
+        const savedName = getStoredName(activeRoomId)
+        if (savedName) {
+            setName(savedName)
+            setMyName(savedName)
+        }
+
+        if (savedToken) {
+            setView('room')
+        }
+    }, [])
 
     useEffect(() => {
         if (view !== 'landing' || isAuthPending) return
@@ -124,6 +152,21 @@ function App() {
     useEffect(() => {
         soundBoardRef.current = soundBoard
     }, [soundBoard])
+
+    useEffect(() => {
+        if (!retryDeadline) return
+        const timer = setInterval(() => {
+            const now = Date.now()
+            if (now >= retryDeadline) {
+                setRetryDeadline(null)
+                setError(null)
+            } else {
+                const remaining = Math.ceil((retryDeadline - now) / 1000)
+                setError(`Too many requests. Wait for ${remaining}s`)
+            }
+        }, 1000)
+        return () => clearInterval(timer)
+    }, [retryDeadline])
 
     useEffect(() => {
         const prime = () => soundBoardRef.current?.prime()
@@ -183,10 +226,12 @@ function App() {
     ): Promise<string | null> => {
         if (!currentToken || !roomId) return currentToken
         const expMs = getJwtExpMs(currentToken)
-        if (!expMs) return currentToken
-        if (expMs - Date.now() > REFRESH_THRESHOLD_MS) {
+        let shouldRefresh = !expMs || (expMs - Date.now() < REFRESH_THRESHOLD_MS);
+
+        if (!shouldRefresh) {
             return currentToken
         }
+
         try {
             const nextToken = await refreshTokenMutation.mutateAsync({ new_token: currentToken, roomId })
             if (nextToken !== currentToken) {
@@ -194,8 +239,12 @@ function App() {
                 persistAuth(roomId, nextToken)
             }
             return nextToken
-        } catch {
-            return currentToken
+        } catch (error) {
+            const errMsg = (error as Error).message || ''
+            if (errMsg.includes('room_not_found')) {
+                clearActiveRoomId()
+            }
+            return null
         }
     }
 
@@ -218,6 +267,8 @@ function App() {
 
     const createRoom = async () => {
         if (isAuthPending) return
+        if (retryDeadline && Date.now() < retryDeadline) return
+
         setError(null)
         try {
             const data = await createRoomMutation.mutateAsync({
@@ -235,12 +286,19 @@ function App() {
             showNotice('Room created. You are the admin.', 'ok', 3000)
             persistAuth(data.room_id, data.token, name)
         } catch (err) {
-            setError((err as Error).message)
+            if (err instanceof ApiError && err.status === 429 && err.retryAfter) {
+                setRetryDeadline(Date.now() + err.retryAfter * 1000)
+                setError(`Too many requests. Wait for ${err.retryAfter}s`)
+            } else {
+                setError((err as Error).message)
+            }
         }
     }
 
     const joinRoom = async () => {
         if (isAuthPending) return
+        if (retryDeadline && Date.now() < retryDeadline) return
+
         setError(null)
         try {
             const hadStoredToken = Boolean(getStoredToken(roomId))
@@ -257,7 +315,12 @@ function App() {
             }
             persistAuth(roomId, data.token ?? undefined, name)
         } catch (err) {
-            setError((err as Error).message)
+            if (err instanceof ApiError && err.status === 429 && err.retryAfter) {
+                setRetryDeadline(Date.now() + err.retryAfter * 1000)
+                setError(`Too many requests. Wait for ${err.retryAfter}s`)
+            } else {
+                setError((err as Error).message)
+            }
         }
     }
 
@@ -272,8 +335,8 @@ function App() {
         setWsState('connecting')
         const freshToken = await refreshTokenIfNeeded(token, roomId)
         if (!freshToken) {
-            setError('missing_token_or_room')
-            setWsState('disconnected')
+            appendLog('Session invalid or room closed.', 'bad')
+            resetSession()
             return
         }
         const wsUrl = `${window.location.origin.replace('http', 'ws')}/ws/${roomId}?token=${freshToken}`
@@ -281,9 +344,11 @@ function App() {
         wsRef.current = ws
 
         ws.onopen = () => {
+            connectionFailuresRef.current = 0
             setWsState('connected')
             appendLog('WebSocket connected.', 'ok')
             setResult('idle')
+            setWinnerName('')
             setHasBuzzedThisRound(false)
             setRoundLocked(false)
         }
@@ -294,6 +359,7 @@ function App() {
                     case 'accepted':
                         appendLog(`${msg.name} buzzed first.`, 'ok', msg.ts_ms)
                         setRoundLocked(true)
+                        setWinnerName(msg.name)
                         if (msg.name === myName) {
                             setResult('won')
                             triggerFlash('win')
@@ -312,12 +378,14 @@ function App() {
                     case 'timed_out':
                         appendLog(`${msg.name} timed out.`, 'bad', msg.ts_ms)
                         setResult('idle')
+                        setWinnerName('')
                         setRoundLocked(false)
                         soundBoardRef.current?.playTimeout()
                         break
                     case 'round_started':
                         appendLog('Round started.', 'ok', msg.ts_ms)
                         setResult('idle')
+                        setWinnerName('')
                         setHasBuzzedThisRound(false)
                         setRoundLocked(false)
                         showNotice('Round started. Buzz now!', 'ok', 2200)
@@ -362,9 +430,28 @@ function App() {
                 appendLog('Invalid message from server.', 'warn')
             }
         }
-        ws.onclose = () => {
+        ws.onclose = async () => {
             setWsState('disconnected')
-            appendLog('WebSocket disconnected.', 'warn')
+
+            connectionFailuresRef.current += 1
+            if (connectionFailuresRef.current > 3 && view === 'room' && token && roomId) {
+                try {
+                    await roomsApi.refreshToken({ roomId, new_token: token })
+                } catch (e) {
+                    const msg = (e as Error).message
+                    if (msg.includes('room_not_found') || msg.includes('user_not_in_room')) {
+                        if (msg.includes('room_not_found')) {
+                            clearActiveRoomId()
+                        }
+                        resetSession()
+                        return
+                    }
+                }
+
+                resetSession()
+            } else {
+                appendLog('WebSocket disconnected.', 'warn')
+            }
         }
         ws.onerror = () => {
             setWsState('disconnected')
@@ -496,13 +583,16 @@ function App() {
     }, [soundMenuOpen])
 
     const buzzDisabled = wsState !== 'connected' || hasBuzzedThisRound || roundLocked
-    const buzzStatus = hasBuzzedThisRound
-        ? 'Buzzed this round.'
-        : roundLocked
-          ? 'Someone is answering.'
-          : wsState === 'connected'
-            ? 'Tap once per round or press space.'
-            : 'Connect to buzz.'
+    const isWinning = winnerName === myName
+    const buzzStatus = roundLocked
+        ? (isWinning ? '' : 'Someone is answering.')
+        : hasBuzzedThisRound
+            ? ''
+            : wsState === 'connected'
+                ? 'Tap once per round or press space.'
+                : 'Connect to buzz.'
+
+    const buzzLabel = winnerName || (hasBuzzedThisRound ? 'Buzzed already' : 'Buzz')
 
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
@@ -724,10 +814,13 @@ function App() {
                         <div className="buzzer-area">
                             <button
                                 className={`buzzer-button ${hasBuzzedThisRound ? 'pressed' : ''}`}
-                                onClick={sendBuzz}
+                                onPointerDown={(e) => {
+                                    if (e.target instanceof HTMLButtonElement && e.target.disabled) return;
+                                    sendBuzz()
+                                }}
                                 disabled={buzzDisabled}
                             >
-                                <span className="buzzer-label">Buzz</span>
+                                <span className="buzzer-label">{buzzLabel}</span>
                                 <span className="buzzer-sub">{buzzStatus}</span>
                             </button>
                         </div>

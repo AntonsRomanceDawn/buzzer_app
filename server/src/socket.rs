@@ -5,6 +5,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use governor::{Quota, RateLimiter};
 use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use core::game::PlayerId;
 
@@ -25,8 +26,17 @@ pub async fn handle_socket(socket: WebSocket, room: Arc<RoomState>, session: Pla
         .await
         .unwrap_or(false);
     if !attached {
+        warn!(
+            "[WS] Failed to attach connection for player {} (id: {})",
+            session.name, session.player_id
+        );
         return;
     }
+
+    info!(
+        "[WS] Attached connection for player {} (id: {})",
+        session.name, session.player_id
+    );
 
     let inbound_limiter = RateLimiter::direct(Quota::per_second(
         NonZeroU32::new(20).expect("non-zero ws inbound quota"),
@@ -38,6 +48,7 @@ pub async fn handle_socket(socket: WebSocket, room: Arc<RoomState>, session: Pla
                 match outbound {
                     Some(text) => {
                         if sender.send(Message::Text(text.into())).await.is_err() {
+                            warn!("[WS] Failed to send message to player {}", session.player_id);
                             break;
                         }
                     }
@@ -48,6 +59,7 @@ pub async fn handle_socket(socket: WebSocket, room: Arc<RoomState>, session: Pla
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
                         if inbound_limiter.check().is_err() {
+                            warn!("[WS] Rate limit exceeded for player {}", session.player_id);
                             room.send_denied_to(session.player_id, "rate_limited");
                             continue;
                         }
@@ -69,6 +81,7 @@ pub async fn handle_socket(socket: WebSocket, room: Arc<RoomState>, session: Pla
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
+                        info!("[WS] Client closed connection for player {}", session.player_id);
                         break;
                     }
                     _ => {}
@@ -77,6 +90,7 @@ pub async fn handle_socket(socket: WebSocket, room: Arc<RoomState>, session: Pla
         }
     }
 
+    info!("[WS] Detaching connection for player {}", session.player_id);
     room.detach_connection(session.player_id);
 }
 

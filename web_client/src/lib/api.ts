@@ -15,11 +15,29 @@ export type RefreshTokenResponse = {
     new_token: string
 }
 
+export class ApiError extends Error {
+    status: number
+    retryAfter?: number
+
+    constructor(message: string, status: number, retryAfter?: number) {
+        super(message)
+        this.status = status
+        this.retryAfter = retryAfter
+    }
+}
+
 async function apiRequest<T>(url: string, init?: RequestInit): Promise<T> {
     const resp = await fetch(url, init)
     if (!resp.ok) {
         const text = await resp.text()
-        throw new Error(text || `request_failed_${resp.status}`)
+        let retryAfter: number | undefined
+        if (resp.status === 429) {
+            const retryHeader = resp.headers.get('retry-after')
+            if (retryHeader) {
+                retryAfter = parseInt(retryHeader, 10)
+            }
+        }
+        throw new ApiError(text || `request_failed_${resp.status}`, resp.status, retryAfter)
     }
     return (await resp.json()) as T
 }
@@ -51,17 +69,13 @@ export const roomsApi = {
     },
 
     refreshToken: async (payload: { roomId: string; new_token: string }) => {
-        try {
-            const data = await apiRequest<RefreshTokenResponse>(
-                `/api/rooms/${payload.roomId}/refresh_token`,
-                {
-                    method: 'POST',
-                    headers: { Authorization: `Bearer ${payload.new_token}` },
-                }
-            )
-            return data.new_token || payload.new_token
-        } catch {
-            return payload.new_token
-        }
+        const data = await apiRequest<RefreshTokenResponse>(
+            `/api/rooms/${payload.roomId}/refresh_token`,
+            {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${payload.new_token}` },
+            }
+        )
+        return data.new_token || payload.new_token
     },
 }

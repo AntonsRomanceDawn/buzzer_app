@@ -27,6 +27,7 @@ use socket::{PlayerSession, handle_socket};
 use state::app_state::AppState;
 
 use crate::state::room_state::RoomConfig;
+use tracing::{error, info, warn};
 
 const TICK_IN_MS: u64 = 10;
 const DEFAULT_ANSWER_WINDOW_IN_MS: u64 = 5_000;
@@ -35,6 +36,12 @@ const MAX_ANSWER_WINDOW_IN_MS: u64 = 60_000;
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
     let state = AppState::new();
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
@@ -54,7 +61,7 @@ async fn main() {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let listener = TcpListener::bind(addr).await.expect("bind");
-    println!("Web server running on http://{}", addr);
+    info!("Web server running on http://{}", addr);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -158,6 +165,7 @@ async fn ws_handler(
     Query(query): Query<WsAuthQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, AppError> {
+    info!("[WS] Handshake initiated for room: {}", room_id);
     let room = state.get_room(&room_id)?;
 
     let claims = state.auth().verify(&query.token)?;
@@ -174,6 +182,11 @@ async fn ws_handler(
         player_id: claims.player_id,
         name: claims.name,
     };
+
+    info!(
+        "[WS] Handshake accepted for player: {} in room: {}",
+        session.name, room_id
+    );
 
     Ok(ws
         .on_upgrade(move |socket| handle_socket(socket, room, session))

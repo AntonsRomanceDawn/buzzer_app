@@ -2,6 +2,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use tracing::warn;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -20,6 +21,7 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        warn!("Responding with error: {:?}", self);
         match self {
             AppError::RoomNotFound => (StatusCode::NOT_FOUND, "room_not_found").into_response(),
             AppError::InvalidEmptyName => {
