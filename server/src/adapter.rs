@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -9,20 +9,22 @@ use std::{
 use dashmap::DashMap;
 use tokio::{sync::mpsc, time};
 
-use core::adapter::{self, BuzzerInput, BuzzerOutput, TimeSource};
-use core::game::{Action, BuzzerGame, Config, PlayerId};
+use core::adapter::{self, GameInput, GameOutput, TimeSource};
+use core::game::{BuzzerGame, Config, OutputEvent, PlayerId};
 
 use crate::dtos::ServerMessage;
-use crate::utils::time::now_millis;
 
 pub fn spawn_room_loop(
     tick_in_ms: u64,
     answer_window_in_ms: u64,
     buzz_rx: mpsc::UnboundedReceiver<PlayerId>,
     reset_flag: Arc<AtomicBool>,
+    continue_flag: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    locked_out_mask: Arc<Mutex<u128>>,
     routes: Arc<DashMap<PlayerId, mpsc::UnboundedSender<String>>>,
     names_by_id: Arc<DashMap<PlayerId, String>>,
+    next_id: Arc<Mutex<PlayerId>>,
 ) {
     tokio::spawn(async move {
         let mut game = BuzzerGame::new(Config {
@@ -32,7 +34,10 @@ pub fn spawn_room_loop(
         let time = InstantTime {
             start: Instant::now(),
         };
-        let mut input = ChannelInput { rx: buzz_rx };
+        let mut input = ChannelInput {
+            rx: buzz_rx,
+            next_player_id: next_id,
+        };
         let mut output = RoutedOutput {
             routes,
             names_by_id,
@@ -44,9 +49,15 @@ pub fn spawn_room_loop(
                 break;
             }
             if reset_flag.swap(false, Ordering::SeqCst) {
-                adapter::reset(&mut game);
+                adapter::start_round(&mut game, &input, &mut output);
+            }
+            if continue_flag.swap(false, Ordering::SeqCst) {
+                adapter::continue_round(&mut game, &mut output);
             }
             adapter::step(&mut game, &time, &mut input, &mut output);
+            if let Ok(mut mask) = locked_out_mask.lock() {
+                *mask = game.locked_out_players();
+            }
         }
     });
 }
@@ -63,11 +74,16 @@ impl TimeSource for InstantTime {
 
 struct ChannelInput {
     rx: mpsc::UnboundedReceiver<PlayerId>,
+    next_player_id: Arc<Mutex<PlayerId>>,
 }
 
-impl BuzzerInput for ChannelInput {
+impl GameInput for ChannelInput {
     fn next_buzz(&mut self) -> Option<PlayerId> {
         self.rx.try_recv().ok()
+    }
+
+    fn current_player_count(&self) -> PlayerId {
+        *self.next_player_id.lock().expect("next_id lock")
     }
 }
 
@@ -76,31 +92,34 @@ struct RoutedOutput {
     names_by_id: Arc<DashMap<PlayerId, String>>,
 }
 
-impl BuzzerOutput for RoutedOutput {
-    fn on_action(&mut self, action: Action) {
-        match action {
-            Action::Accepted(player, deadline_in_ms) => {
-                let name = self.name_for(player);
-                let msg = ServerMessage::Accepted {
-                    name,
-                    deadline_in_ms,
-                    ts_ms: now_millis(),
-                };
+impl GameOutput for RoutedOutput {
+    fn on_event(&mut self, event: OutputEvent) {
+        match event {
+            OutputEvent::Accepted(player_id, _) => {
+                let name = self.name_for(player_id);
+                let msg = ServerMessage::Accepted { name };
                 self.broadcast(msg);
             }
-            Action::Rejected(player) => {
-                if let Some(tx) = self.routes.get(&player).map(|entry| entry.value().clone()) {
-                    let _ = tx.send(serialize(ServerMessage::Rejected {
-                        ts_ms: now_millis(),
-                    }));
+            OutputEvent::Rejected(player_id) => {
+                if let Some(tx) = self
+                    .routes
+                    .get(&player_id)
+                    .map(|entry| entry.value().clone())
+                {
+                    let _ = tx.send(serialize(ServerMessage::Rejected));
                 }
             }
-            Action::TimedOut(player) => {
-                let name = self.name_for(player);
-                let msg = ServerMessage::TimedOut {
-                    name,
-                    ts_ms: now_millis(),
-                };
+            OutputEvent::TimedOut(player_id) => {
+                let name = self.name_for(player_id);
+                let msg = ServerMessage::TimedOut { name };
+                self.broadcast(msg);
+            }
+            OutputEvent::RoundStarted => {
+                let msg = ServerMessage::RoundStarted;
+                self.broadcast(msg);
+            }
+            OutputEvent::RoundContinued => {
+                let msg = ServerMessage::RoundContinued;
                 self.broadcast(msg);
             }
         }

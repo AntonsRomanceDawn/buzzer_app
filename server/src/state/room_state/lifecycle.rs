@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::app_state::ADMIN_PLAYER_ID;
 use crate::utils::time::now_seconds;
 
 impl RoomState {
@@ -31,6 +32,9 @@ impl RoomState {
         for player_id in expired {
             self.send_kicked_to(player_id);
             let _ = self.remove_player(player_id);
+            if player_id == ADMIN_PLAYER_ID {
+                self.shutdown.store(true, Ordering::SeqCst);
+            }
         }
     }
 }

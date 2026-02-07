@@ -71,11 +71,11 @@ pub async fn handle_socket(socket: WebSocket, room: Arc<RoomState>, session: Pla
                                 ClientMessage::StartRound => {
                                     room.start_round(session.player_id);
                                 }
-                                ClientMessage::SetAdmin { name } => {
-                                    let _ = room.set_admin_by_name(session.player_id, &name).await;
-                                }
                                 ClientMessage::Kick { name } => {
                                     let _ = room.kick_by_name(session.player_id, &name).await;
+                                }
+                                ClientMessage::ContinueRound => {
+                                    room.continue_round(session.player_id);
                                 }
                             }
                         }

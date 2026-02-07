@@ -27,12 +27,12 @@ use socket::{PlayerSession, handle_socket};
 use state::app_state::AppState;
 
 use crate::state::room_state::RoomConfig;
-use tracing::{error, info, warn};
+use tracing::info;
 
 const TICK_IN_MS: u64 = 10;
-const DEFAULT_ANSWER_WINDOW_IN_MS: u64 = 5_000;
-const MIN_ANSWER_WINDOW_IN_MS: u64 = 1_000;
-const MAX_ANSWER_WINDOW_IN_MS: u64 = 60_000;
+const DEFAULT_ANSWER_WINDOW_IN_MS: u64 = 5000;
+const MIN_ANSWER_WINDOW_IN_MS: u64 = 500;
+const MAX_ANSWER_WINDOW_IN_MS: u64 = 60000;
 
 #[tokio::main]
 async fn main() {
@@ -119,11 +119,12 @@ async fn join_room(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
 
-    let token = room.join(&requested_name, token).await?;
+    let (token, role) = room.join(&requested_name, token).await?;
     let response = JoinRoomResponse {
         room_id: room_id.to_string(),
         token,
         answer_window_in_ms: room.answer_window_in_ms(),
+        role,
     };
     Ok((StatusCode::OK, Json(response)))
 }

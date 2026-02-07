@@ -1,7 +1,7 @@
 //! Platform adapter traits for no_std integration.
 //! This keeps I/O (buttons, timers, LEDs, sounds) outside the core game logic.
 
-use crate::game::{Action, BuzzerGame, PlayerId};
+use crate::game::{BuzzerGame, OutputEvent, PlayerId};
 
 /// Source of time for the game engine.
 pub trait TimeSource {
@@ -9,15 +9,15 @@ pub trait TimeSource {
     fn now_ms(&self) -> u64;
 }
 
-/// Input source that can report which player (if any) buzzed.
-pub trait BuzzerInput {
-    /// Return a buzzing player if a new press occurred since last poll.
+pub trait GameInput {
+    /// Return the next buzzing player, or None if no pending buzzes.
     fn next_buzz(&mut self) -> Option<PlayerId>;
+    fn current_player_count(&self) -> PlayerId;
 }
 
 /// Output sink for game actions (LEDs, sounds, UI updates, etc.).
-pub trait BuzzerOutput {
-    fn on_action(&mut self, action: Action);
+pub trait GameOutput {
+    fn on_event(&mut self, event: OutputEvent);
 }
 
 /// Minimal "runner" that ties inputs + time + outputs to the game logic.
@@ -25,22 +25,29 @@ pub trait BuzzerOutput {
 pub fn step<T, I, O>(game: &mut BuzzerGame, time: &T, input: &mut I, output: &mut O)
 where
     T: TimeSource,
-    I: BuzzerInput,
-    O: BuzzerOutput,
+    I: GameInput,
+    O: GameOutput,
 {
     let now = time.now_ms();
 
-    if let Some(player) = input.next_buzz() {
-        let action = game.buzz(player, now);
-        output.on_action(action);
+    while let Some(player) = input.next_buzz() {
+        let event = game.buzz(player, now);
+        output.on_event(event);
     }
 
-    if let Some(action) = game.tick(now) {
-        output.on_action(action);
+    if let Some(event) = game.tick(now) {
+        output.on_event(event);
     }
 }
 
 /// Reset the game state (clears locks and returns to idle).
-pub fn reset(game: &mut BuzzerGame) {
-    game.reset();
+pub fn start_round<I: GameInput, O: GameOutput>(game: &mut BuzzerGame, input: &I, output: &mut O) {
+    game.set_curr_player_id(input.current_player_count());
+    let event = game.start_round();
+    output.on_event(event);
+}
+
+pub fn continue_round<O: GameOutput>(game: &mut BuzzerGame, output: &mut O) {
+    let event = game.continue_round();
+    output.on_event(event);
 }

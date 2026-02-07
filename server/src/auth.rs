@@ -1,5 +1,5 @@
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use jsonwebtoken::errors::ErrorKind;
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 use core::game::PlayerId;
@@ -44,6 +44,7 @@ impl JwtAuth {
     ) -> Result<(String, u64), AppError> {
         let now = now_seconds();
         let exp = now + self.ttl_seconds;
+
         let claims = Claims {
             room_id: room_id.to_string(),
             player_id,
@@ -54,6 +55,7 @@ impl JwtAuth {
         };
         let token = jsonwebtoken::encode(&Header::default(), &claims, &self.encoding)
             .map_err(|_| AppError::Internal)?;
+
         Ok((token, exp))
     }
 

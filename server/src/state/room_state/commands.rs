@@ -36,13 +36,6 @@ impl RoomState {
                     RoomCommand::DetachConnection { player_id } => {
                         room.detach_connection_direct(player_id);
                     }
-                    RoomCommand::SetAdminByName {
-                        requester_id,
-                        name,
-                        resp,
-                    } => {
-                        let _ = resp.send(room.set_admin_by_name_direct(requester_id, &name));
-                    }
                     RoomCommand::KickByName {
                         requester_id,
                         name,
@@ -52,6 +45,9 @@ impl RoomState {
                     }
                     RoomCommand::StartRound { requester_id } => {
                         room.start_round_direct(requester_id);
+                    }
+                    RoomCommand::ContinueRound { requester_id } => {
+                        room.continue_round_direct(requester_id);
                     }
                     RoomCommand::CleanupExpired => {
                         room.cleanup_expired();
@@ -72,7 +68,11 @@ impl RoomState {
         rx.await.map_err(|_| AppError::Internal)?
     }
 
-    pub async fn join(&self, requested_name: &str, token: Option<&str>) -> Result<String, AppError> {
+    pub async fn join(
+        &self,
+        requested_name: &str,
+        token: Option<&str>,
+    ) -> Result<(String, Role), AppError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(RoomCommand::Join {
@@ -119,22 +119,6 @@ impl RoomState {
             .send(RoomCommand::DetachConnection { player_id });
     }
 
-    pub async fn set_admin_by_name(
-        &self,
-        requester_id: PlayerId,
-        name: &str,
-    ) -> Result<bool, AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(RoomCommand::SetAdminByName {
-                requester_id,
-                name: name.to_string(),
-                resp: tx,
-            })
-            .map_err(|_| AppError::Internal)?;
-        rx.await.map_err(|_| AppError::Internal)
-    }
-
     pub async fn kick_by_name(&self, requester_id: PlayerId, name: &str) -> Result<bool, AppError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -151,6 +135,12 @@ impl RoomState {
         let _ = self
             .command_tx
             .send(RoomCommand::StartRound { requester_id });
+    }
+
+    pub fn continue_round(&self, requester_id: PlayerId) {
+        let _ = self
+            .command_tx
+            .send(RoomCommand::ContinueRound { requester_id });
     }
 
     pub fn request_cleanup(&self) {

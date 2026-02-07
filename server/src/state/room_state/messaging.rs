@@ -1,6 +1,6 @@
 use super::*;
+use crate::state::app_state::ADMIN_PLAYER_ID;
 use crate::utils::time::now_seconds;
-use crate::utils::time::now_millis;
 
 impl RoomState {
     pub(super) fn attach_connection_direct(
@@ -32,24 +32,39 @@ impl RoomState {
             return;
         }
         self.reset_flag.store(true, Ordering::SeqCst);
-        self.broadcast(ServerMessage::RoundStarted {
-            ts_ms: now_millis(),
-        });
+    }
+
+    pub(super) fn continue_round_direct(&self, requester_id: PlayerId) {
+        if !self.is_admin(requester_id) {
+            self.send_denied_to(requester_id, "forbidden");
+            return;
+        }
+        self.continue_flag.store(true, Ordering::SeqCst);
     }
 
     pub fn participants(&self) -> Vec<ParticipantInfo> {
+        let mask = *self.locked_out_mask.lock().expect("lock shared mask");
         let mut list = self
             .names_by_id
             .iter()
             .map(|entry| {
                 let player_id = *entry.key();
                 let name = entry.value().clone();
-                let role = self
-                    .roles_by_id
-                    .get(&player_id)
-                    .map(|role_entry| *role_entry.value())
-                    .unwrap_or(Role::Player);
-                ParticipantInfo { name, role }
+                let role = if player_id == ADMIN_PLAYER_ID {
+                    Role::Admin
+                } else {
+                    Role::Player
+                };
+                let locked_out = if player_id < 128 {
+                    (mask & (1u128 << player_id)) != 0
+                } else {
+                    false
+                };
+                ParticipantInfo {
+                    name,
+                    role,
+                    locked_out,
+                }
             })
             .collect::<Vec<_>>();
         list.sort_by(|a, b| a.name.cmp(&b.name));
@@ -60,18 +75,10 @@ impl RoomState {
         self.answer_window_in_ms
     }
 
-    // pub fn id(&self) -> &str {
-    //     &self.id
-    // }
-
     pub fn admin_present(&self) -> bool {
         let now = now_seconds();
-        let admin_id = self.admin_id.lock().ok().and_then(|id| *id);
-        let Some(admin_id) = admin_id else {
-            return false;
-        };
         self.token_exp_by_id
-            .get(&admin_id)
+            .get(&ADMIN_PLAYER_ID)
             .map(|entry| now < *entry.value())
             .unwrap_or(false)
     }
@@ -86,7 +93,6 @@ impl RoomState {
     pub fn broadcast_participants(&self) {
         let msg = ServerMessage::Participants {
             participants: self.participants(),
-            ts_ms: now_millis(),
         };
         self.broadcast(msg);
     }
@@ -94,24 +100,17 @@ impl RoomState {
     pub fn send_participants_to(&self, player_id: PlayerId) {
         let msg = ServerMessage::Participants {
             participants: self.participants(),
-            ts_ms: now_millis(),
         };
         self.send_to_player(player_id, msg);
     }
 
     pub fn send_kicked_to(&self, player_id: PlayerId) {
-        self.send_to_player(
-            player_id,
-            ServerMessage::Kicked {
-                ts_ms: now_millis(),
-            },
-        );
+        self.send_to_player(player_id, ServerMessage::Kicked);
     }
 
     pub fn send_denied_to(&self, player_id: PlayerId, reason: &str) {
         let msg = ServerMessage::ActionDenied {
             reason: reason.to_string(),
-            ts_ms: now_millis(),
         };
         self.send_to_player(player_id, msg);
     }

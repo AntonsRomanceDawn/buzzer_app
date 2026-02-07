@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::app_state::ADMIN_PLAYER_ID;
 
 impl RoomState {
     fn name_exists(&self, name: &str) -> bool {
@@ -6,23 +7,15 @@ impl RoomState {
     }
 
     pub fn insert_player(&self, name: String, role: Role) -> Result<PlayerId, AppError> {
-        let player_id = {
-            let mut next_id = self.next_id.lock().expect("next_id lock");
-            let id = *next_id;
-            if id >= 128 as usize {
-                return Err(AppError::FullRoom);
-            }
-            *next_id = next_id.wrapping_add(1);
-            id
-        };
+        let mut next_id = self.next_id.lock().expect("next_id lock");
+        let player_id = *next_id;
+        if player_id >= core::game::MAX_PLAYER_ID {
+            return Err(AppError::FullRoom);
+        }
+        *next_id = next_id.wrapping_add(1);
 
         self.ids_by_name.insert(name.clone(), player_id);
         self.names_by_id.insert(player_id, name);
-        self.roles_by_id.insert(player_id, role);
-
-        if role == Role::Admin {
-            self.set_admin_id(player_id);
-        }
 
         Ok(player_id)
     }
@@ -36,70 +29,21 @@ impl RoomState {
             .map(|(_, name)| name)
             .map_or(Err(AppError::Kicked), Ok)?;
         self.ids_by_name.remove(&name);
-        let role = self
-            .roles_by_id
-            .remove(&player_id)
-            .map(|(_, role)| role)
-            .unwrap_or(Role::Player);
-        let mut admin_id = self.admin_id.lock().expect("admin_id lock");
-        if admin_id.map(|id| id == player_id).unwrap_or(false) {
-            *admin_id = None;
-        }
+
+        let role = if player_id == ADMIN_PLAYER_ID {
+            Role::Admin
+        } else {
+            Role::Player
+        };
         Ok((name, role))
     }
 
-    pub fn set_admin_id(&self, player_id: PlayerId) {
-        let mut admin_id = self.admin_id.lock().expect("admin_id lock");
-        *admin_id = Some(player_id);
-    }
     fn set_token_expiry(&self, player_id: PlayerId, exp: u64) {
         self.token_exp_by_id.insert(player_id, exp);
     }
 
-    pub(super) fn set_admin_by_name_direct(&self, requester_id: PlayerId, name: &str) -> bool {
-        if !self.is_admin(requester_id) {
-            self.send_denied_to(requester_id, "forbidden");
-            return false;
-        }
-        let target = name.trim();
-        if target.is_empty() {
-            self.send_denied_to(requester_id, "user_not_found");
-            return false;
-        }
-        if let Some(requester_name) = self
-            .names_by_id
-            .get(&requester_id)
-            .map(|entry| entry.value().clone())
-        {
-            if requester_name == target {
-                self.send_denied_to(requester_id, "cannot_set_yourself_admin");
-                return false;
-            }
-        }
-        let player_id = match self.ids_by_name.get(target) {
-            Some(entry) => *entry.value(),
-            None => {
-                self.send_denied_to(requester_id, "user_not_found");
-                return false;
-            }
-        };
-        let old_admin_id = self.admin_id.lock().ok().and_then(|id| *id);
-        if let Some(old_admin_id) = old_admin_id {
-            self.roles_by_id.insert(old_admin_id, Role::Player);
-        }
-        self.roles_by_id.insert(player_id, Role::Admin);
-        self.set_admin_id(player_id);
-        self.broadcast_participants();
-        true
-    }
-
     pub fn is_admin(&self, player_id: PlayerId) -> bool {
-        self.admin_id
-            .lock()
-            .ok()
-            .and_then(|id| *id)
-            .map(|id| id == player_id)
-            .unwrap_or(false)
+        player_id == ADMIN_PLAYER_ID
     }
 
     pub(super) fn kick_by_name_direct(&self, requester_id: PlayerId, name: &str) -> bool {
@@ -112,17 +56,8 @@ impl RoomState {
             self.send_denied_to(requester_id, "user_not_found");
             return false;
         }
-        if let Some(requester_name) = self
-            .names_by_id
-            .get(&requester_id)
-            .map(|entry| entry.value().clone())
-        {
-            if requester_name == target {
-                self.send_denied_to(requester_id, "cannot_kick_self");
-                return false;
-            }
-        }
-        let player_id = match self.ids_by_name.get(target) {
+
+        let target_id = match self.ids_by_name.get(target) {
             Some(entry) => *entry.value(),
             None => {
                 self.send_denied_to(requester_id, "user_not_found");
@@ -130,8 +65,13 @@ impl RoomState {
             }
         };
 
-        self.send_kicked_to(player_id);
-        let _ = self.remove_player(player_id);
+        if target_id == requester_id {
+            self.send_denied_to(requester_id, "cannot_kick_self");
+            return false;
+        }
+
+        self.send_kicked_to(target_id);
+        let _ = self.remove_player(target_id);
         self.broadcast_participants();
         true
     }
@@ -153,21 +93,35 @@ impl RoomState {
         &self,
         requested_name: &str,
         token: Option<&str>,
-    ) -> Result<String, AppError> {
-        let mut role = Role::Player;
+    ) -> Result<(String, Role), AppError> {
         if let Some(token) = token {
             let claims = self.auth.verify(token)?;
             if claims.room_id != self.room_id {
                 return Err(AppError::RoomMismatch);
             }
-            let (_, r) = self.remove_player(claims.player_id)?;
-            role = r;
+
+            if !self.player_matches(claims.player_id, &claims.name) {
+                return Err(AppError::Kicked);
+            }
+
+            self.ids_by_name
+                .insert(claims.name.clone(), claims.player_id);
+            self.ids_by_name
+                .insert(requested_name.to_string(), claims.player_id);
+            self.names_by_id
+                .insert(claims.player_id, requested_name.to_string());
+            let new_token = self.issue_token(claims.player_id, requested_name, claims.role)?;
+            return Ok((new_token, claims.role));
         }
+
         if self.name_exists(requested_name) {
             return Err(AppError::NameTaken);
         }
+
+        let role = Role::Player;
         let player_id = self.insert_player(requested_name.to_string(), role)?;
-        self.issue_token(player_id, requested_name, role)
+        let token = self.issue_token(player_id, requested_name, role)?;
+        Ok((token, role))
     }
 
     pub(super) fn refresh_token_direct(&self, token: &str) -> Result<String, AppError> {

@@ -6,6 +6,7 @@ import {
     clearActiveRoomId,
     getActiveRoomId,
     getStoredName,
+    getStoredRole,
     getStoredToken,
     persistAuth,
 } from './lib/storage'
@@ -14,34 +15,29 @@ import './App.css'
 type ParticipantInfo = {
     name: string
     role: Role
+    locked_out: boolean
 }
 
 type ServerMessage =
-    | { type: 'accepted'; name: string; deadline_in_ms: number; ts_ms: number }
-    | { type: 'rejected'; ts_ms: number }
-    | { type: 'timed_out'; name: string; ts_ms: number }
-    | { type: 'round_started'; ts_ms: number }
-    | { type: 'participants'; participants: ParticipantInfo[]; ts_ms: number }
-    | { type: 'action_denied'; reason: string; ts_ms: number }
-    | { type: 'kicked'; ts_ms: number }
-
-type LogEntry = {
-    id: string
-    ts: string
-    text: string
-    tone?: 'ok' | 'warn' | 'bad'
-}
+    | { type: 'accepted'; name: string }
+    | { type: 'rejected' }
+    | { type: 'timed_out'; name: string }
+    | { type: 'round_started' }
+    | { type: 'round_continued' }
+    | { type: 'participants'; participants: ParticipantInfo[] }
+    | { type: 'action_denied'; reason: string }
+    | { type: 'kicked' }
 
 type Notice = {
     id: string
     text: string
-    tone?: LogEntry['tone']
+    tone?: 'ok' | 'warn' | 'bad'
 }
 
-const REFRESH_THRESHOLD_MS = 60 * 60 * 1000
-const REFRESH_CHECK_INTERVAL_MS = 15 * 60 * 1000
+const REFRESH_THRESHOLD_SECS = 60 * 60
+const REFRESH_CHECK_INTERVAL_SECS = 15 * 60
 
-function getJwtExpMs(token: string): number | null {
+function getJwtExpSecs(token: string): number | null {
     try {
         const [, payload] = token.split('.')
         if (!payload) return null
@@ -50,7 +46,7 @@ function getJwtExpMs(token: string): number | null {
         const decoded = atob(padded)
         const data = JSON.parse(decoded) as { exp?: number }
         if (!data.exp) return null
-        return data.exp * 1000
+        return data.exp
     } catch {
         return null
     }
@@ -77,20 +73,19 @@ function App() {
     const [wsState, setWsState] = useState<'disconnected' | 'connecting' | 'connected'>(
         'disconnected'
     )
-    const [logs, setLogs] = useState<LogEntry[]>([])
-    const [adminTarget, setAdminTarget] = useState('')
-    const [kickTarget, setKickTarget] = useState('')
     const [result, setResult] = useState<'idle' | 'won' | 'lost' | 'rejected'>('idle')
     const [winnerName, setWinnerName] = useState('')
     const [myName, setMyName] = useState('')
     const [roomMode, setRoomMode] = useState<'create' | 'join'>('create')
     const [answerWindowInMs, setAnswerWindowInMs] = useState('5000')
     const [hasBuzzedThisRound, setHasBuzzedThisRound] = useState(false)
+    const [answeringPlayer, setAnsweringPlayer] = useState<string | null>(null)
     const [notice, setNotice] = useState<Notice | null>(null)
     const [flashTone, setFlashTone] = useState<'win' | 'lose' | null>(null)
     const [soundMenuOpen, setSoundMenuOpen] = useState(false)
     const [soundSettings, setSoundSettings] = useState<SoundSettings>({
         roundStart: true,
+        roundContinued: true,
         win: true,
         lose: true,
         timeout: true,
@@ -99,7 +94,6 @@ function App() {
     const wsRef = useRef<WebSocket | null>(null)
     const noticeTimerRef = useRef<number | null>(null)
     const flashTimerRef = useRef<number | null>(null)
-    const roleRef = useRef<Role | null>(null)
     const soundMenuRef = useRef<HTMLDivElement | null>(null)
     const soundSettingsBackupRef = useRef<SoundSettings | null>(null)
     const soundBoardRef = useRef<ReturnType<typeof useSoundBoard> | null>(null)
@@ -111,13 +105,36 @@ function App() {
 
     const soundEnabled =
         soundSettings.roundStart ||
+        soundSettings.roundContinued ||
         soundSettings.win ||
         soundSettings.lose ||
         soundSettings.timeout
     const soundBoard = useSoundBoard(soundEnabled, soundSettings)
 
     useEffect(() => {
+        const params = new URLSearchParams(window.location.search)
+        const roomParam = params.get('room')
         const activeRoomId = getActiveRoomId()
+
+        if (roomParam) {
+            setRoomId(roomParam)
+            setRoomMode('join')
+
+            if (roomParam === activeRoomId) {
+                const savedToken = getStoredToken(roomParam)
+                const savedName = getStoredName(roomParam)
+                const savedRole = getStoredRole(roomParam) as Role | null
+                if (savedToken && savedName && savedRole) {
+                    setToken(savedToken)
+                    setName(savedName)
+                    setMyName(savedName)
+                    setRole(savedRole)
+                    setView('room')
+                }
+            }
+            return
+        }
+
         if (!activeRoomId) return
 
         setRoomId(activeRoomId)
@@ -128,6 +145,11 @@ function App() {
         if (savedName) {
             setName(savedName)
             setMyName(savedName)
+        }
+
+        const savedRole = getStoredRole(activeRoomId) as Role | null
+        if (savedRole) {
+            setRole(savedRole)
         }
 
         if (savedToken) {
@@ -146,6 +168,11 @@ function App() {
         if (savedName) {
             setName(savedName)
             setMyName(savedName)
+        }
+
+        const savedRole = getStoredRole(roomId) as Role | null
+        if (savedRole) {
+            setRole(savedRole)
         }
     }, [isAuthPending, roomId, view])
 
@@ -178,20 +205,7 @@ function App() {
         }
     }, [])
 
-    const appendLog = (text: string, tone: LogEntry['tone'] = 'ok', tsMs?: number) => {
-        const ts = new Date(tsMs ?? Date.now()).toLocaleTimeString([], {
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            fractionalSecondDigits: 3,
-        })
-        setLogs((prev) => [
-            { id: crypto.randomUUID(), ts, text, tone },
-            ...prev.slice(0, 200),
-        ])
-    }
-
-    const showNotice = (text: string, tone: LogEntry['tone'] = 'ok', durationMs = 2800) => {
+    const showNotice = (text: string, tone: 'ok' | 'warn' | 'bad' = 'ok', durationMs = 2800) => {
         setNotice({ id: crypto.randomUUID(), text, tone })
         if (noticeTimerRef.current) {
             window.clearTimeout(noticeTimerRef.current)
@@ -225,8 +239,8 @@ function App() {
         roomId: string
     ): Promise<string | null> => {
         if (!currentToken || !roomId) return currentToken
-        const expMs = getJwtExpMs(currentToken)
-        let shouldRefresh = !expMs || (expMs - Date.now() < REFRESH_THRESHOLD_MS);
+        const expSecs = getJwtExpSecs(currentToken)
+        let shouldRefresh = !expSecs || (expSecs - Date.now() / 1000 < REFRESH_THRESHOLD_SECS);
 
         if (!shouldRefresh) {
             return currentToken
@@ -250,11 +264,9 @@ function App() {
 
     const resetSession = () => {
         setRole(null)
-        roleRef.current = null
         setParticipants([])
         setToken(null)
         setWsState('disconnected')
-        setLogs([])
         setResult('idle')
         setHasBuzzedThisRound(false)
         setRoundLocked(false)
@@ -263,6 +275,16 @@ function App() {
             wsRef.current = null
         }
         setView('landing')
+        // Clear query param if present
+        if (window.location.search) {
+            window.history.replaceState({}, '', window.location.pathname)
+        }
+    }
+
+    const copyInviteLink = () => {
+        const url = `${window.location.origin}?room=${roomId}`
+        navigator.clipboard.writeText(url)
+        showNotice('Invite link copied!', 'ok', 2000)
     }
 
     const createRoom = async () => {
@@ -278,13 +300,11 @@ function App() {
             setRoomId(data.room_id)
             setMyName(name)
             setRole('admin')
-            roleRef.current = 'admin'
             setToken(data.token)
             setAnswerWindowInMs(String(data.answer_window_in_ms))
             setView('room')
-            appendLog('Room created. You are the admin.', 'ok')
             showNotice('Room created. You are the admin.', 'ok', 3000)
-            persistAuth(data.room_id, data.token, name)
+            persistAuth(data.room_id, data.token, name, 'admin')
         } catch (err) {
             if (err instanceof ApiError && err.status === 429 && err.retryAfter) {
                 setRetryDeadline(Date.now() + err.retryAfter * 1000)
@@ -301,19 +321,16 @@ function App() {
 
         setError(null)
         try {
-            const hadStoredToken = Boolean(getStoredToken(roomId))
             const data = await joinRoomMutation.mutateAsync({ roomId, name })
-            const nextRole = hadStoredToken ? role ?? 'player' : 'player'
+            const nextRole = data.role
             setRole(nextRole)
-            roleRef.current = nextRole
             setToken(data.token)
             setAnswerWindowInMs(String(data.answer_window_in_ms))
             setView('room')
-            appendLog('Joined room.', 'ok')
             if (name.trim()) {
                 setMyName(name.trim())
             }
-            persistAuth(roomId, data.token ?? undefined, name)
+            persistAuth(roomId, data.token ?? undefined, name, nextRole)
         } catch (err) {
             if (err instanceof ApiError && err.status === 429 && err.retryAfter) {
                 setRetryDeadline(Date.now() + err.retryAfter * 1000)
@@ -334,11 +351,6 @@ function App() {
         }
         setWsState('connecting')
         const freshToken = await refreshTokenIfNeeded(token, roomId)
-        if (!freshToken) {
-            appendLog('Session invalid or room closed.', 'bad')
-            resetSession()
-            return
-        }
         const wsUrl = `${window.location.origin.replace('http', 'ws')}/ws/${roomId}?token=${freshToken}`
         const ws = new WebSocket(wsUrl)
         wsRef.current = ws
@@ -346,7 +358,6 @@ function App() {
         ws.onopen = () => {
             connectionFailuresRef.current = 0
             setWsState('connected')
-            appendLog('WebSocket connected.', 'ok')
             setResult('idle')
             setWinnerName('')
             setHasBuzzedThisRound(false)
@@ -357,9 +368,9 @@ function App() {
                 const msg = JSON.parse(event.data) as ServerMessage
                 switch (msg.type) {
                     case 'accepted':
-                        appendLog(`${msg.name} buzzed first.`, 'ok', msg.ts_ms)
                         setRoundLocked(true)
                         setWinnerName(msg.name)
+                        setAnsweringPlayer(msg.name)
                         if (msg.name === myName) {
                             setResult('won')
                             triggerFlash('win')
@@ -372,62 +383,63 @@ function App() {
                         }
                         break
                     case 'rejected':
-                        appendLog('Buzz rejected.', 'warn', msg.ts_ms)
                         setResult('rejected')
                         break
                     case 'timed_out':
-                        appendLog(`${msg.name} timed out.`, 'bad', msg.ts_ms)
                         setResult('idle')
                         setWinnerName('')
                         setRoundLocked(false)
+                        setAnsweringPlayer(null)
+                        setParticipants((prev) =>
+                            prev.map((p) => (p.name === msg.name ? { ...p, locked_out: true } : p))
+                        )
                         soundBoardRef.current?.playTimeout()
+                        if (msg.name === myName) {
+                            showNotice('You timed out!', 'warn', 2200)
+                        } else {
+                            showNotice(`Buzzer open! ${msg.name} timed out`, 'ok', 2200)
+                        }
+                        break
+                    case 'round_continued':
+                        setResult('idle')
+                        setWinnerName('')
+                        setRoundLocked(false)
+                        if (answeringPlayer) {
+                            setParticipants((prev) =>
+                                prev.map((p) =>
+                                    p.name === answeringPlayer ? { ...p, locked_out: true } : p
+                                )
+                            )
+                            setAnsweringPlayer(null)
+                        }
+                        showNotice('Buzzer open!', 'ok', 2200)
+                        soundBoardRef.current?.playRoundContinued()
                         break
                     case 'round_started':
-                        appendLog('Round started.', 'ok', msg.ts_ms)
                         setResult('idle')
                         setWinnerName('')
                         setHasBuzzedThisRound(false)
                         setRoundLocked(false)
+                        setAnsweringPlayer(null)
+                        setParticipants((prev) => prev.map((p) => ({ ...p, locked_out: false })))
                         showNotice('Round started. Buzz now!', 'ok', 2200)
                         soundBoardRef.current?.playRoundStart()
                         break
                     case 'participants': {
                         setParticipants(msg.participants)
-                        const identity = myName || name
-                        if (identity) {
-                            const me = msg.participants.find((participant) => participant.name === identity)
-                            if (me) {
-                                const prevRole = roleRef.current
-                                roleRef.current = me.role
-                                setRole(me.role)
-                                if (prevRole !== 'admin' && me.role === 'admin') {
-                                    showNotice('You are now the admin.', 'ok', 3000)
-                                } else if (prevRole === 'admin' && me.role !== 'admin') {
-                                    showNotice('Admin role transferred.', 'warn', 3000)
-                                }
-                            } else if (view === 'room') {
-                                appendLog('You are no longer in the room.', 'bad')
-                                resetSession()
-                                return
-                            }
-                        }
-                        appendLog('Participants updated.', 'ok', msg.ts_ms)
                         break
                     }
                     case 'action_denied':
-                        appendLog(`Action denied: ${msg.reason}`, 'warn', msg.ts_ms)
                         break
                     case 'kicked':
-                        appendLog('You were removed from the room.', 'bad', msg.ts_ms)
                         showNotice('You were kicked from the room.', 'bad', 6000)
                         setResult('idle')
                         resetSession()
                         break
                     default:
-                        appendLog('Unknown server message.', 'warn')
                 }
             } catch {
-                appendLog('Invalid message from server.', 'warn')
+                // ignore
             }
         }
         ws.onclose = async () => {
@@ -450,26 +462,21 @@ function App() {
 
                 resetSession()
             } else {
-                appendLog('WebSocket disconnected.', 'warn')
             }
         }
         ws.onerror = () => {
             setWsState('disconnected')
-            appendLog('WebSocket error.', 'bad')
         }
     }
 
     const sendBuzz = () => {
         if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            appendLog('WebSocket not connected.', 'warn')
             return
         }
         if (roundLocked) {
-            appendLog('Round is in progress.', 'warn')
             return
         }
         if (hasBuzzedThisRound) {
-            appendLog('Already buzzed this round.', 'warn')
             return
         }
         wsRef.current.send(JSON.stringify({ type: 'buzz' }))
@@ -477,37 +484,33 @@ function App() {
 
     const startRound = () => {
         if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            appendLog('WebSocket not connected.', 'warn')
             return
         }
         wsRef.current.send(JSON.stringify({ type: 'start_round' }))
     }
 
-    const setAdmin = () => {
+    const continueRound = () => {
         if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            appendLog('WebSocket not connected.', 'warn')
             return
         }
-        if (!adminTarget.trim()) {
-            appendLog('Admin target required.', 'warn')
-            return
-        }
-        wsRef.current.send(JSON.stringify({ type: 'set_admin', name: adminTarget.trim() }))
-        setAdminTarget('')
+        wsRef.current.send(JSON.stringify({ type: 'continue_round' }))
     }
 
-    const kickPlayer = () => {
-        if (wsRef.current?.readyState !== WebSocket.OPEN) {
-            appendLog('WebSocket not connected.', 'warn')
-            return
-        }
-        if (!kickTarget.trim()) {
-            appendLog('Kick target required.', 'warn')
-            return
-        }
-        wsRef.current.send(JSON.stringify({ type: 'kick', name: kickTarget.trim() }))
-        setKickTarget('')
+    const kickPlayer = (targetName: string) => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return
+        if (!confirm(`Kick ${targetName}?`)) return
+        wsRef.current.send(JSON.stringify({ type: 'kick', name: targetName }))
     }
+
+    useEffect(() => {
+        if (view === 'room' && roomId) {
+            const url = new URL(window.location.href)
+            if (url.searchParams.get('room') !== roomId) {
+                url.searchParams.set('room', roomId)
+                window.history.replaceState({}, '', url.toString())
+            }
+        }
+    }, [view, roomId])
 
     useEffect(() => {
         if (view !== 'room') return
@@ -519,7 +522,7 @@ function App() {
         if (view !== 'room' || !token || !roomId) return
         const interval = setInterval(() => {
             void refreshTokenIfNeeded(token, roomId)
-        }, REFRESH_CHECK_INTERVAL_MS)
+        }, REFRESH_CHECK_INTERVAL_SECS)
         return () => clearInterval(interval)
     }, [view, token, roomId])
 
@@ -537,6 +540,7 @@ function App() {
     useEffect(() => {
         const soundEnabled =
             soundSettings.roundStart ||
+            soundSettings.roundContinued ||
             soundSettings.win ||
             soundSettings.lose ||
             soundSettings.timeout
@@ -550,6 +554,7 @@ function App() {
             soundSettingsBackupRef.current = soundSettings
             setSoundSettings({
                 roundStart: false,
+                roundContinued: false,
                 win: false,
                 lose: false,
                 timeout: false,
@@ -563,6 +568,7 @@ function App() {
         }
         setSoundSettings({
             roundStart: true,
+            roundContinued: true,
             win: true,
             lose: true,
             timeout: true,
@@ -582,24 +588,33 @@ function App() {
         return () => window.removeEventListener('pointerdown', onPointerDown)
     }, [soundMenuOpen])
 
-    const buzzDisabled = wsState !== 'connected' || hasBuzzedThisRound || roundLocked
+    const iAmLockedOut = participants.find((p) => p.name === myName)?.locked_out ?? false
+
+    const buzzDisabled =
+        wsState !== 'connected' || hasBuzzedThisRound || roundLocked || iAmLockedOut
     const isWinning = winnerName === myName
     const buzzStatus = roundLocked
-        ? (isWinning ? '' : 'Someone is answering.')
-        : hasBuzzedThisRound
+        ? isWinning
             ? ''
-            : wsState === 'connected'
-                ? 'Tap once per round or press space.'
-                : 'Connect to buzz.'
+            : 'Someone is answering.'
+        : iAmLockedOut
+            ? 'Locked out this round.'
+            : hasBuzzedThisRound
+                ? ''
+                : wsState === 'connected'
+                    ? 'Tap once per round or press space.'
+                    : 'Connect to buzz.'
 
-    const buzzLabel = winnerName || (hasBuzzedThisRound ? 'Buzzed already' : 'Buzz')
+    const buzzLabel =
+        winnerName ||
+        (iAmLockedOut ? 'Locked Out' : hasBuzzedThisRound ? 'Buzzed already' : 'Buzz')
 
     useEffect(() => {
         const onKeyDown = (event: KeyboardEvent) => {
             if (event.key !== ' ' && event.key !== 'Spacebar' && event.code !== 'Space') return
             if (view !== 'room') return
             if (wsState !== 'connected') return
-            if (hasBuzzedThisRound) return
+            if (hasBuzzedThisRound || iAmLockedOut) return
             if (isTypingTarget(event.target)) return
             event.preventDefault()
             sendBuzz()
@@ -607,7 +622,7 @@ function App() {
 
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
-    }, [view, wsState, hasBuzzedThisRound, sendBuzz])
+    }, [view, wsState, hasBuzzedThisRound, sendBuzz, iAmLockedOut])
 
     return (
         <div className={`app ${result !== 'idle' ? `status-${result}` : ''}`}>
@@ -683,6 +698,14 @@ function App() {
                                             onChange={() => toggleSoundSetting('roundStart')}
                                         />
                                         Round start
+                                    </label>
+                                    <label className="sound-item">
+                                        <input
+                                            type="checkbox"
+                                            checked={soundSettings.roundContinued}
+                                            onChange={() => toggleSoundSetting('roundContinued')}
+                                        />
+                                        Round continued
                                     </label>
                                     <label className="sound-item">
                                         <input
@@ -805,6 +828,9 @@ function App() {
                                 <p className="panel-sub">Manage the round and send buzzes.</p>
                             </div>
                             <div className="panel-actions">
+                                <button className="ghost" onClick={copyInviteLink}>
+                                    Copy invite
+                                </button>
                                 <button className="ghost" onClick={resetSession}>
                                     Leave room
                                 </button>
@@ -813,7 +839,7 @@ function App() {
 
                         <div className="buzzer-area">
                             <button
-                                className={`buzzer-button ${hasBuzzedThisRound ? 'pressed' : ''}`}
+                                className={`buzzer-button ${hasBuzzedThisRound ? 'pressed' : ''} ${iAmLockedOut ? 'locked-out' : ''}`}
                                 onPointerDown={(e) => {
                                     if (e.target instanceof HTMLButtonElement && e.target.disabled) return;
                                     sendBuzz()
@@ -832,8 +858,31 @@ function App() {
                                     {participants.length === 0 && <li className="muted">No players yet.</li>}
                                     {participants.map((participant) => (
                                         <li key={participant.name}>
-                                            <span>{participant.name}</span>
-                                            <span className={`badge ${participant.role}`}>{participant.role}</span>
+                                            <div className="participant-info">
+                                                <span>{participant.name}</span>
+                                                {participant.locked_out && (
+                                                    <span className="badge">Locked</span>
+                                                )}
+                                                <span className={`badge ${participant.role}`}>
+                                                    {participant.role}
+                                                </span>
+                                            </div>
+                                            {role === 'admin' && participant.role !== 'admin' && (
+                                                <button
+                                                    className="icon-button danger"
+                                                    onClick={() => kickPlayer(participant.name)}
+                                                    title="Kick player"
+                                                    aria-label={`Kick ${participant.name}`}
+                                                >
+                                                    <svg
+                                                        viewBox="0 0 24 24"
+                                                        aria-hidden="true"
+                                                        fill="currentColor"
+                                                    >
+                                                        <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+                                                    </svg>
+                                                </button>
+                                            )}
                                         </li>
                                     ))}
                                 </ul>
@@ -849,57 +898,17 @@ function App() {
                                         >
                                             Start round
                                         </button>
-                                    </div>
-                                    <div className="controls admin-tools">
-                                        <label>
-                                            Set admin
-                                            <input
-                                                value={adminTarget}
-                                                onChange={(event) => setAdminTarget(event.target.value)}
-                                                placeholder="player name"
-                                                disabled={wsState !== 'connected'}
-                                            />
-                                        </label>
                                         <button
                                             className="ghost"
-                                            onClick={setAdmin}
+                                            onClick={continueRound}
                                             disabled={wsState !== 'connected'}
+                                            title="Continue round (reject answer or skip)"
                                         >
-                                            Assign admin
-                                        </button>
-                                    </div>
-                                    <div className="controls admin-tools">
-                                        <label>
-                                            Kick player
-                                            <input
-                                                value={kickTarget}
-                                                onChange={(event) => setKickTarget(event.target.value)}
-                                                placeholder="player name"
-                                                disabled={wsState !== 'connected'}
-                                            />
-                                        </label>
-                                        <button
-                                            className="ghost"
-                                            onClick={kickPlayer}
-                                            disabled={wsState !== 'connected'}
-                                        >
-                                            Kick
+                                            Continue Round
                                         </button>
                                     </div>
                                 </div>
                             )}
-                            <div className="room-card logs">
-                                <h3>Event log</h3>
-                                <div className="log-list">
-                                    {logs.length === 0 && <p className="muted">No events yet.</p>}
-                                    {logs.map((entry) => (
-                                        <div key={entry.id} className={`log ${entry.tone ?? 'ok'}`}>
-                                            <span>{entry.ts}</span>
-                                            <span>{entry.text}</span>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
                         </div>
 
                         {error && <div className="error">Error: {error}</div>}

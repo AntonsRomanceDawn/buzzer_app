@@ -1,3 +1,4 @@
+use core::game::PlayerId;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -11,6 +12,8 @@ use super::room_state::{RoomConfig, RoomId, RoomState};
 
 pub const TOKEN_TTL_IN_SECS: u64 = 2 * 60 * 60;
 pub const APP_CLEANUP_INTERVAL_IN_SECS: u64 = 30 * 60;
+
+pub const ADMIN_PLAYER_ID: PlayerId = 0;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -37,7 +40,6 @@ impl AppState {
 
     pub fn create_room(&self, config: RoomConfig, tick_in_ms: u64) -> (RoomId, Arc<RoomState>) {
         let room_id = self.create_random_room_id();
-        //                                        this room_id in RoomState is not actually ever used in the current model
         let room = RoomState::new(room_id.clone(), config, tick_in_ms, self.auth());
         self.inner.rooms.insert(room_id.clone(), Arc::clone(&room));
         (room_id, room)

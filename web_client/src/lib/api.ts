@@ -9,6 +9,7 @@ export type CreateRoomResponse = {
 export type JoinRoomResponse = {
     token: string | null
     answer_window_in_ms: number
+    role: Role
 }
 
 export type RefreshTokenResponse = {

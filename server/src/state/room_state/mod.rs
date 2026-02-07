@@ -32,14 +32,14 @@ pub struct RoomState {
     buzz_tx: mpsc::UnboundedSender<PlayerId>,
     routes: Arc<DashMap<PlayerId, mpsc::UnboundedSender<String>>>,
     names_by_id: Arc<DashMap<PlayerId, String>>,
-    roles_by_id: Arc<DashMap<PlayerId, Role>>,
     ids_by_name: Arc<DashMap<String, PlayerId>>,
     token_exp_by_id: Arc<DashMap<PlayerId, u64>>,
     command_tx: mpsc::UnboundedSender<RoomCommand>,
-    next_id: Mutex<PlayerId>,
-    admin_id: Mutex<Option<PlayerId>>,
+    next_id: Arc<Mutex<PlayerId>>,
     reset_flag: Arc<AtomicBool>,
+    continue_flag: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    locked_out_mask: Arc<Mutex<u128>>,
 }
 
 enum RoomCommand {
@@ -50,7 +50,7 @@ enum RoomCommand {
     Join {
         requested_name: String,
         token: Option<String>,
-        resp: oneshot::Sender<Result<String, AppError>>,
+        resp: oneshot::Sender<Result<(String, Role), AppError>>,
     },
     RefreshToken {
         token: String,
@@ -65,17 +65,15 @@ enum RoomCommand {
     DetachConnection {
         player_id: PlayerId,
     },
-    SetAdminByName {
-        requester_id: PlayerId,
-        name: String,
-        resp: oneshot::Sender<bool>,
-    },
     KickByName {
         requester_id: PlayerId,
         name: String,
         resp: oneshot::Sender<bool>,
     },
     StartRound {
+        requester_id: PlayerId,
+    },
+    ContinueRound {
         requester_id: PlayerId,
     },
     CleanupExpired,
@@ -85,27 +83,32 @@ impl RoomState {
     pub(super) fn new(
         id: RoomId,
         config: RoomConfig,
-        tick_ms: u64,
+        tick_in_ms: u64,
         auth: Arc<JwtAuth>,
     ) -> Arc<Self> {
         let (buzz_tx, buzz_rx) = mpsc::unbounded_channel::<PlayerId>();
         let routes = Arc::new(DashMap::new());
         let names_by_id = Arc::new(DashMap::new());
-        let roles_by_id = Arc::new(DashMap::new());
         let ids_by_name = Arc::new(DashMap::new());
         let token_exp_by_id = Arc::new(DashMap::new());
+        let next_id = Arc::new(Mutex::new(0));
         let reset_flag = Arc::new(AtomicBool::new(false));
+        let continue_flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let locked_out_mask = Arc::new(Mutex::new(0));
         let (command_tx, command_rx) = mpsc::unbounded_channel::<RoomCommand>();
 
         spawn_room_loop(
-            tick_ms,
+            tick_in_ms,
             config.answer_window_in_ms,
             buzz_rx,
             Arc::clone(&reset_flag),
+            Arc::clone(&continue_flag),
             Arc::clone(&shutdown),
+            Arc::clone(&locked_out_mask),
             Arc::clone(&routes),
             Arc::clone(&names_by_id),
+            Arc::clone(&next_id),
         );
 
         let room = Arc::new(Self {
@@ -116,14 +119,14 @@ impl RoomState {
             buzz_tx,
             routes,
             names_by_id,
-            roles_by_id,
             ids_by_name,
             token_exp_by_id,
             command_tx,
-            next_id: Mutex::new(0),
-            admin_id: Mutex::new(None),
+            next_id,
             reset_flag,
+            continue_flag,
             shutdown,
+            locked_out_mask,
         });
 
         RoomState::spawn_command_loop(Arc::clone(&room), command_rx);

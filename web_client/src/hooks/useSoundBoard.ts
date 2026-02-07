@@ -8,6 +8,7 @@ import timeoutWav from '../assets/sounds/timeout.wav'
 
 export type SoundSettings = {
     roundStart: boolean
+    roundContinued: boolean
     win: boolean
     lose: boolean
     timeout: boolean
@@ -15,6 +16,7 @@ export type SoundSettings = {
 
 type SoundBoard = {
     playRoundStart: () => void
+    playRoundContinued: () => void
     playWin: () => void
     playLose: () => void
     playTimeout: () => void
@@ -40,6 +42,13 @@ export function useSoundBoard(enabled: boolean, settings: SoundSettings): SoundB
     const primedRef = useRef(false)
     const [playRoundStart, roundMeta] = useSound(roundStartWav, {
         volume: 0.3,
+        playbackRate: 1.1,
+        interrupt: true,
+        preload: true,
+    })
+    const [playRoundContinued, roundContinuedMeta] = useSound(roundStartWav, {
+        volume: 0.3,
+        playbackRate: 0.9,
         interrupt: true,
         preload: true,
     })
@@ -61,24 +70,31 @@ export function useSoundBoard(enabled: boolean, settings: SoundSettings): SoundB
 
     useEffect(() => {
         roundMeta?.sound?.load()
+        roundContinuedMeta?.sound?.load()
         winMeta?.sound?.load()
         loseMeta?.sound?.load()
         timeoutMeta?.sound?.load()
-    }, [roundMeta?.sound, winMeta?.sound, loseMeta?.sound, timeoutMeta?.sound])
+    }, [roundMeta?.sound, roundContinuedMeta?.sound, winMeta?.sound, loseMeta?.sound, timeoutMeta?.sound])
 
     const prime = useCallback(() => {
         if (primedRef.current) return
         primeHowl(roundMeta?.sound)
+        primeHowl(roundContinuedMeta?.sound)
         primeHowl(winMeta?.sound)
         primeHowl(loseMeta?.sound)
         primeHowl(timeoutMeta?.sound)
         primedRef.current = true
-    }, [roundMeta?.sound, winMeta?.sound, loseMeta?.sound, timeoutMeta?.sound])
+    }, [roundMeta?.sound, roundContinuedMeta?.sound, winMeta?.sound, loseMeta?.sound, timeoutMeta?.sound])
 
     return {
         playRoundStart: () => {
             if (enabled && settings.roundStart) {
                 playRoundStart()
+            }
+        },
+        playRoundContinued: () => {
+            if (enabled && settings.roundContinued) {
+                playRoundContinued()
             }
         },
         playWin: () => {
