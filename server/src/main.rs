@@ -2,6 +2,7 @@ mod adapter;
 mod auth;
 mod dtos;
 mod errors;
+mod ratelimit;
 mod socket;
 mod state;
 mod utils;
@@ -23,6 +24,7 @@ use dtos::{
     CreateRoomRequest, CreateRoomResponse, JoinRoomRequest, JoinRoomResponse, RefreshTokenResponse,
 };
 use errors::AppError;
+use ratelimit::RateLimitSettings;
 use socket::{PlayerSession, handle_socket};
 use state::app_state::AppState;
 
@@ -43,23 +45,61 @@ async fn main() {
         .init();
 
     let state = AppState::new();
-    let governor_conf = Arc::new(
+
+    // Rate limiting is keyed per real client IP (resolved through trusted proxy
+    // hops, see `ratelimit`). NOTE: tower_governor's `per_*` methods set the
+    // REPLENISH INTERVAL for one token, not a rate -- `per_millisecond(100)`
+    // replenishes a token every 100ms => 10 req/s sustained.
+    let rl = RateLimitSettings::from_env();
+    info!(
+        "Rate limits per client IP: api {}/burst over {}ms, create {}/burst over {}ms, trusted proxy hops: {}",
+        rl.api_burst, rl.api_period_ms, rl.create_burst, rl.create_period_ms, rl.trusted_hops
+    );
+
+    // General interactive traffic: join, token refresh, ws upgrade. Generous so a
+    // reconnect flurry or several tabs from one user never trips it.
+    let api_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(30)
-            .burst_size(60)
+            .key_extractor(rl.extractor())
+            .per_millisecond(rl.api_period_ms)
+            .burst_size(rl.api_burst)
             .finish()
-            .expect("valid rate limit config"),
+            .expect("valid api rate limit config"),
+    );
+    // Room creation allocates a room + background tasks, so it gets a much tighter
+    // bucket than the interactive endpoints.
+    let create_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(rl.extractor())
+            .per_millisecond(rl.create_period_ms)
+            .burst_size(rl.create_burst)
+            .finish()
+            .expect("valid create rate limit config"),
     );
 
     let app = Router::new()
-        .route("/api/rooms", post(create_room))
-        .route("/api/rooms/{room_id}/join", post(join_room))
-        .route("/api/rooms/{room_id}/refresh_token", post(token_refresh))
-        .route("/ws/{room_id}", get(ws_handler))
-        .layer(GovernorLayer::new(governor_conf))
+        .route(
+            "/api/rooms",
+            post(create_room).layer(GovernorLayer::new(Arc::clone(&create_conf))),
+        )
+        .route(
+            "/api/rooms/{room_id}/join",
+            post(join_room).layer(GovernorLayer::new(Arc::clone(&api_conf))),
+        )
+        .route(
+            "/api/rooms/{room_id}/refresh_token",
+            post(token_refresh).layer(GovernorLayer::new(Arc::clone(&api_conf))),
+        )
+        .route(
+            "/ws/{room_id}",
+            get(ws_handler).layer(GovernorLayer::new(Arc::clone(&api_conf))),
+        )
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .expect("BIND_ADDR must be a valid socket address, e.g. 0.0.0.0:3000");
     let listener = TcpListener::bind(addr).await.expect("bind");
     info!("Web server running on http://{}", addr);
     axum::serve(

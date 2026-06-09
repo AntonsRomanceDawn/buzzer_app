@@ -104,12 +104,26 @@ impl RoomState {
                 return Err(AppError::Kicked);
             }
 
-            self.ids_by_name
-                .insert(claims.name.clone(), claims.player_id);
-            self.ids_by_name
-                .insert(requested_name.to_string(), claims.player_id);
-            self.names_by_id
-                .insert(claims.player_id, requested_name.to_string());
+            // Rejoining with a valid token keeps the same player_id. Only touch the
+            // name maps when the player actually wants a different name, and never
+            // let them claim a name already owned by someone else.
+            if requested_name != claims.name {
+                let taken_by_other = self
+                    .ids_by_name
+                    .get(requested_name)
+                    .map(|entry| *entry.value() != claims.player_id)
+                    .unwrap_or(false);
+                if taken_by_other {
+                    return Err(AppError::NameTaken);
+                }
+
+                self.ids_by_name.remove(&claims.name);
+                self.ids_by_name
+                    .insert(requested_name.to_string(), claims.player_id);
+                self.names_by_id
+                    .insert(claims.player_id, requested_name.to_string());
+            }
+
             let new_token = self.issue_token(claims.player_id, requested_name, claims.role)?;
             return Ok((new_token, claims.role));
         }

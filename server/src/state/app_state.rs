@@ -4,6 +4,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use rand::RngCore;
 use rand::distr::{Alphanumeric, SampleString};
+use tracing::warn;
 
 use crate::auth::JwtAuth;
 use crate::errors::AppError;
@@ -27,8 +28,7 @@ struct AppStateInner {
 
 impl AppState {
     pub fn new() -> Self {
-        let mut secret = [0u8; 32];
-        rand::rng().fill_bytes(&mut secret);
+        let secret = Self::load_jwt_secret();
         let auth = Arc::new(JwtAuth::new(&secret, TOKEN_TTL_IN_SECS));
         let inner = Arc::new(AppStateInner {
             rooms: DashMap::new(),
@@ -36,6 +36,36 @@ impl AppState {
         });
         Self::spawn_room_cleanup(Arc::clone(&inner));
         Self { inner }
+    }
+
+    /// Loads the JWT signing secret from the `JWT_SECRET` env var. Falls back to a
+    /// random per-process secret (with a warning) so local dev works out of the box,
+    /// but in that mode every restart invalidates all outstanding tokens. Production
+    /// deployments must set a stable `JWT_SECRET` of at least 32 bytes.
+    fn load_jwt_secret() -> Vec<u8> {
+        match std::env::var("JWT_SECRET") {
+            Ok(secret) if secret.len() >= 32 => secret.into_bytes(),
+            Ok(_) => {
+                warn!(
+                    "JWT_SECRET is shorter than 32 bytes; ignoring it and using an ephemeral \
+                     secret (all tokens will be invalidated on restart)"
+                );
+                Self::random_secret()
+            }
+            Err(_) => {
+                warn!(
+                    "JWT_SECRET is not set; using an ephemeral secret (all tokens will be \
+                     invalidated on restart). Set JWT_SECRET in production."
+                );
+                Self::random_secret()
+            }
+        }
+    }
+
+    fn random_secret() -> Vec<u8> {
+        let mut secret = [0u8; 32];
+        rand::rng().fill_bytes(&mut secret);
+        secret.to_vec()
     }
 
     pub fn create_room(&self, config: RoomConfig, tick_in_ms: u64) -> (RoomId, Arc<RoomState>) {

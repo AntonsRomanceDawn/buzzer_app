@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useCreateRoom, useJoinRoom, useRefreshToken } from './hooks/useRoomMutations'
 import { type SoundSettings, useSoundBoard } from './hooks/useSoundBoard'
-import { ApiError, roomsApi, type Role } from './lib/api'
+import { ApiError, type Role } from './lib/api'
 import {
     clearActiveRoomId,
     getActiveRoomId,
@@ -36,6 +36,19 @@ type Notice = {
 
 const REFRESH_THRESHOLD_SECS = 60 * 60
 const REFRESH_CHECK_INTERVAL_SECS = 15 * 60
+
+// WebSocket reconnect backoff: 0.5s, 1s, 2s, 4s, 8s, capped at 10s, plus jitter.
+// This is what keeps a flaky connection (or a server hiccup) from turning into a
+// request storm against the rate limiter.
+const BASE_RECONNECT_DELAY_MS = 500
+const MAX_RECONNECT_DELAY_MS = 10000
+const RECONNECT_JITTER_MS = 300
+
+// A session is only abandoned on a definitive auth/room failure. Transient errors
+// (network, rate-limit, 5xx) are retried with the existing token.
+function isSessionFatal(error: ApiError): boolean {
+    return error.status === 401 || error.status === 403 || error.status === 404
+}
 
 function getJwtExpSecs(token: string): number | null {
     try {
@@ -97,7 +110,10 @@ function App() {
     const soundMenuRef = useRef<HTMLDivElement | null>(null)
     const soundSettingsBackupRef = useRef<SoundSettings | null>(null)
     const soundBoardRef = useRef<ReturnType<typeof useSoundBoard> | null>(null)
-    const connectionFailuresRef = useRef(0)
+    const reconnectAttemptsRef = useRef(0)
+    const reconnectTimerRef = useRef<number | null>(null)
+    const answeringPlayerRef = useRef<string | null>(null)
+    const myNameRef = useRef('')
     const createRoomMutation = useCreateRoom()
     const joinRoomMutation = useJoinRoom()
     const refreshTokenMutation = useRefreshToken()
@@ -180,6 +196,16 @@ function App() {
         soundBoardRef.current = soundBoard
     }, [soundBoard])
 
+    // Keep refs in sync so the long-lived WebSocket onmessage handler always reads
+    // current values instead of the ones captured when the socket was opened.
+    useEffect(() => {
+        answeringPlayerRef.current = answeringPlayer
+    }, [answeringPlayer])
+
+    useEffect(() => {
+        myNameRef.current = myName
+    }, [myName])
+
     useEffect(() => {
         if (!retryDeadline) return
         const timer = setInterval(() => {
@@ -240,7 +266,7 @@ function App() {
     ): Promise<string | null> => {
         if (!currentToken || !roomId) return currentToken
         const expSecs = getJwtExpSecs(currentToken)
-        let shouldRefresh = !expSecs || (expSecs - Date.now() / 1000 < REFRESH_THRESHOLD_SECS);
+        const shouldRefresh = !expSecs || expSecs - Date.now() / 1000 < REFRESH_THRESHOLD_SECS
 
         if (!shouldRefresh) {
             return currentToken
@@ -254,11 +280,16 @@ function App() {
             }
             return nextToken
         } catch (error) {
-            const errMsg = (error as Error).message || ''
-            if (errMsg.includes('room_not_found')) {
-                clearActiveRoomId()
+            // Definitive auth/room failure -> the session is dead, give up (null).
+            // Anything else (network, rate-limit, 5xx) is transient: keep the current
+            // token so the caller can retry later instead of dropping the player.
+            if (error instanceof ApiError && isSessionFatal(error)) {
+                if (error.status === 404) {
+                    clearActiveRoomId()
+                }
+                return null
             }
-            return null
+            return currentToken
         }
     }
 
@@ -270,6 +301,11 @@ function App() {
         setResult('idle')
         setHasBuzzedThisRound(false)
         setRoundLocked(false)
+        reconnectAttemptsRef.current = 0
+        if (reconnectTimerRef.current) {
+            window.clearTimeout(reconnectTimerRef.current)
+            reconnectTimerRef.current = null
+        }
         if (wsRef.current) {
             wsRef.current.close()
             wsRef.current = null
@@ -347,16 +383,29 @@ function App() {
             return
         }
         if (wsRef.current) {
-            wsRef.current.close()
+            // Detach handlers before closing so this stale socket's late onclose
+            // can't increment the reconnect counter or flip state under the new one.
+            const stale = wsRef.current
+            wsRef.current = null
+            stale.onopen = null
+            stale.onmessage = null
+            stale.onclose = null
+            stale.onerror = null
+            stale.close()
         }
         setWsState('connecting')
         const freshToken = await refreshTokenIfNeeded(token, roomId)
-        const wsUrl = `${window.location.origin.replace('http', 'ws')}/ws/${roomId}?token=${freshToken}`
+        if (!freshToken) {
+            // Session is no longer valid (kicked, expired, or room gone).
+            resetSession()
+            return
+        }
+        const wsUrl = `${window.location.origin.replace('http', 'ws')}/ws/${roomId}?token=${encodeURIComponent(freshToken)}`
         const ws = new WebSocket(wsUrl)
         wsRef.current = ws
 
         ws.onopen = () => {
-            connectionFailuresRef.current = 0
+            reconnectAttemptsRef.current = 0
             setWsState('connected')
             setResult('idle')
             setWinnerName('')
@@ -371,7 +420,7 @@ function App() {
                         setRoundLocked(true)
                         setWinnerName(msg.name)
                         setAnsweringPlayer(msg.name)
-                        if (msg.name === myName) {
+                        if (msg.name === myNameRef.current) {
                             setResult('won')
                             triggerFlash('win')
                             soundBoardRef.current?.playWin()
@@ -394,7 +443,7 @@ function App() {
                             prev.map((p) => (p.name === msg.name ? { ...p, locked_out: true } : p))
                         )
                         soundBoardRef.current?.playTimeout()
-                        if (msg.name === myName) {
+                        if (msg.name === myNameRef.current) {
                             showNotice('You timed out!', 'warn', 2200)
                         } else {
                             showNotice(`Buzzer open! ${msg.name} timed out`, 'ok', 2200)
@@ -404,10 +453,11 @@ function App() {
                         setResult('idle')
                         setWinnerName('')
                         setRoundLocked(false)
-                        if (answeringPlayer) {
+                        if (answeringPlayerRef.current) {
+                            const lockedName = answeringPlayerRef.current
                             setParticipants((prev) =>
                                 prev.map((p) =>
-                                    p.name === answeringPlayer ? { ...p, locked_out: true } : p
+                                    p.name === lockedName ? { ...p, locked_out: true } : p
                                 )
                             )
                             setAnsweringPlayer(null)
@@ -442,27 +492,16 @@ function App() {
                 // ignore
             }
         }
-        ws.onclose = async () => {
+        ws.onclose = () => {
+            // Only react to the socket we currently own; a stale socket closing
+            // after we've already moved on must not disturb a newer connection.
+            if (wsRef.current !== ws) return
+            wsRef.current = null
+            reconnectAttemptsRef.current += 1
             setWsState('disconnected')
-
-            connectionFailuresRef.current += 1
-            if (connectionFailuresRef.current > 3 && view === 'room' && token && roomId) {
-                try {
-                    await roomsApi.refreshToken({ roomId, new_token: token })
-                } catch (e) {
-                    const msg = (e as Error).message
-                    if (msg.includes('room_not_found') || msg.includes('user_not_in_room')) {
-                        if (msg.includes('room_not_found')) {
-                            clearActiveRoomId()
-                        }
-                        resetSession()
-                        return
-                    }
-                }
-
-                resetSession()
-            } else {
-            }
+            // The reconnect effect below schedules the next attempt with backoff.
+            // Whether the session is still valid is decided there, by the token
+            // refresh inside connectWs — not by hammering on every close.
         }
         ws.onerror = () => {
             setWsState('disconnected')
@@ -515,7 +554,22 @@ function App() {
     useEffect(() => {
         if (view !== 'room') return
         if (wsState === 'connected' || wsState === 'connecting') return
-        void connectWs()
+        const attempt = reconnectAttemptsRef.current
+        const delay =
+            attempt === 0
+                ? 0
+                : Math.min(BASE_RECONNECT_DELAY_MS * 2 ** (attempt - 1), MAX_RECONNECT_DELAY_MS) +
+                  Math.floor(Math.random() * RECONNECT_JITTER_MS)
+        reconnectTimerRef.current = window.setTimeout(() => {
+            reconnectTimerRef.current = null
+            void connectWs()
+        }, delay)
+        return () => {
+            if (reconnectTimerRef.current) {
+                window.clearTimeout(reconnectTimerRef.current)
+                reconnectTimerRef.current = null
+            }
+        }
     }, [view, wsState])
 
     useEffect(() => {
